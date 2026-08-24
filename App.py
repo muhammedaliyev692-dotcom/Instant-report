@@ -201,15 +201,24 @@ def top_bottom_by_category(df, num_col, cat_col):
     Uses min_count=1 so a category whose values are all missing shows up as
     NaN (and gets dropped) rather than silently being summed to a
     misleading 0 — which previously made real minimums look wrong.
+
+    Also returns each leader's row count, since a summed total (e.g. one
+    customer's total across all their orders) can legitimately exceed any
+    single row's value — without the count, that looks like a contradiction.
     """
-    grouped = df.groupby(cat_col)[num_col].sum(min_count=1).dropna().sort_values(ascending=False)
-    if len(grouped) == 0:
+    stats = df.groupby(cat_col)[num_col].agg(total="sum", rows="count")
+    stats = stats[stats["rows"] > 0].sort_values("total", ascending=False)
+    if len(stats) == 0:
         return None
+    top = stats.iloc[0]
+    bottom = stats.iloc[-1]
     return {
-        "top_name": grouped.index[0],
-        "top_value": grouped.iloc[0],
-        "bottom_name": grouped.index[-1],
-        "bottom_value": grouped.iloc[-1],
+        "top_name": stats.index[0],
+        "top_value": top["total"],
+        "top_rows": int(top["rows"]),
+        "bottom_name": stats.index[-1],
+        "bottom_value": bottom["total"],
+        "bottom_rows": int(bottom["rows"]),
     }
 
 
@@ -503,9 +512,12 @@ if uploaded:
             if focus_category_cols:
                 tb = top_bottom_by_category(df, col, focus_category_cols[0])
                 if tb and tb["top_name"] != tb["bottom_name"]:
+                    top_rows_note = f" across {tb['top_rows']} record{'s' if tb['top_rows'] != 1 else ''}" if tb["top_rows"] > 1 else ""
+                    bottom_rows_note = f" across {tb['bottom_rows']} record{'s' if tb['bottom_rows'] != 1 else ''}" if tb["bottom_rows"] > 1 else ""
                     bullets.append(
-                        f"By **{focus_category_cols[0]}**: \"{tb['top_name']}\" leads with {fmt(tb['top_value'])}, "
-                        f"while \"{tb['bottom_name']}\" trails at {fmt(tb['bottom_value'])}."
+                        f"By **{focus_category_cols[0]}**: \"{tb['top_name']}\" leads with {fmt(tb['top_value'])} total"
+                        f"{top_rows_note}, while \"{tb['bottom_name']}\" trails at {fmt(tb['bottom_value'])}"
+                        f"{bottom_rows_note}."
                     )
 
             if anomaly_count > 0:
