@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import re
+import pycountry
 
 # ---------------------------------------------------------
 # CONFIG
@@ -239,6 +240,82 @@ def count_anomalies(df, col):
     return int((z_scores > 2.5).sum())
 
 
+# ---------------------------------------------------------
+# GEO / MAP HELPERS
+# ---------------------------------------------------------
+# Common non-standard names/abbreviations pycountry's own lookup won't
+# always catch on its own — filled in by hand for the most frequent cases.
+COUNTRY_ALIASES = {
+    "usa": "United States", "us": "United States", "u.s.": "United States",
+    "u.s.a.": "United States", "america": "United States",
+    "uk": "United Kingdom", "u.k.": "United Kingdom", "britain": "United Kingdom",
+    "great britain": "United Kingdom", "england": "United Kingdom",
+    "uae": "United Arab Emirates", "south korea": "Korea, Republic of",
+    "north korea": "Korea, Democratic People's Republic of",
+    "russia": "Russian Federation", "vietnam": "Viet Nam",
+    "iran": "Iran, Islamic Republic of", "syria": "Syrian Arab Republic",
+    "laos": "Lao People's Democratic Republic", "moldova": "Moldova, Republic of",
+    "tanzania": "Tanzania, United Republic of", "bolivia": "Bolivia, Plurinational State of",
+    "venezuela": "Venezuela, Bolivarian Republic of", "brunei": "Brunei Darussalam",
+    "czechia": "Czechia", "ivory coast": "Côte d'Ivoire",
+    "turkey": "Türkiye", "turkiye": "Türkiye", "türkiye": "Türkiye",
+}
+
+_country_alpha3_cache = {}
+
+def country_name_to_alpha3(raw_value):
+    """Best-effort lookup of a country name/code to its ISO alpha-3 code.
+    Returns None if it can't confidently match — never guesses silently.
+    """
+    if raw_value in _country_alpha3_cache:
+        return _country_alpha3_cache[raw_value]
+    if not isinstance(raw_value, str) or not raw_value.strip():
+        _country_alpha3_cache[raw_value] = None
+        return None
+    key = raw_value.strip()
+    lookup_value = COUNTRY_ALIASES.get(key.lower(), key)
+    result = None
+    try:
+        result = pycountry.countries.lookup(lookup_value).alpha_3
+    except LookupError:
+        try:
+            matches = pycountry.countries.search_fuzzy(lookup_value)
+            if matches:
+                result = matches[0].alpha_3
+        except LookupError:
+            result = None
+    _country_alpha3_cache[raw_value] = result
+    return result
+
+
+def detect_country_column(df, candidate_cols, sample_size=60, match_threshold=0.6):
+    """Checks each candidate text column to see if most of its distinct
+    values look like real country names/codes. Returns the best match, or
+    None if nothing qualifies — this only ever confirms a real match, it
+    doesn't force a column to be treated as countries.
+    """
+    best_col, best_rate = None, 0.0
+    for col in candidate_cols:
+        uniques = df[col].dropna().astype(str).unique()
+        if len(uniques) < 2:
+            continue
+        sample = uniques[:sample_size]
+        matched = sum(1 for v in sample if country_name_to_alpha3(v) is not None)
+        rate = matched / len(sample)
+        if rate >= match_threshold and rate > best_rate:
+            best_col, best_rate = col, rate
+    return best_col
+
+
+def detect_lat_lon_columns(df):
+    """Finds a latitude/longitude column pair by name, if present."""
+    lat_pattern = re.compile(r"^(lat|latitude)$", re.IGNORECASE)
+    lon_pattern = re.compile(r"^(lon|lng|long|longitude)$", re.IGNORECASE)
+    lat_col = next((c for c in df.columns if lat_pattern.match(str(c).strip())), None)
+    lon_col = next((c for c in df.columns if lon_pattern.match(str(c).strip())), None)
+    return lat_col, lon_col
+
+
 GRANULARITY_FREQ = {
     "Daily": "D", "Weekly": "W", "Monthly": "ME",
     "Quarterly": "QE", "Yearly": "YE",
@@ -403,6 +480,10 @@ if uploaded:
     all_id_cols = id_cols + text_id_cols
     if all_id_cols:
         st.caption(f"Excluded as likely ID/reference columns (not real metrics or categories): {', '.join(all_id_cols)}")
+
+    # ---- Geo detection (countries, or explicit lat/lon columns) ----
+    detected_country_col = detect_country_column(df, category_cols)
+    detected_lat_col, detected_lon_col = detect_lat_lon_columns(df)
 
     # ---- Instant overview: totals & averages for every real numeric column ----
     # Shown immediately, before any focus is picked, so you see the full
@@ -661,6 +742,55 @@ if uploaded:
         else:  # Line
             fig2 = px.line(breakdown_df, x=cat_col, y=y_label, markers=True)
         st.plotly_chart(fig2, use_container_width=True)
+
+    # ---- Map ----
+    if detected_country_col or (detected_lat_col and detected_lon_col):
+        st.subheader("Map")
+
+        if detected_country_col:
+            metric_for_map = None
+            if numeric_cols:
+                metric_for_map = st.selectbox(
+                    "Color the map by", numeric_cols, key="map_metric_col",
+                    help=f"Detected \"{detected_country_col}\" as a country column.",
+                )
+            map_df = df[[detected_country_col]].copy()
+            if metric_for_map:
+                map_df[metric_for_map] = df[metric_for_map]
+                grouped = map_df.groupby(detected_country_col)[metric_for_map].sum().reset_index()
+            else:
+                grouped = map_df[detected_country_col].value_counts().reset_index()
+                grouped.columns = [detected_country_col, "Count"]
+                metric_for_map = "Count"
+
+            grouped["iso_alpha3"] = grouped[detected_country_col].apply(country_name_to_alpha3)
+            mappable = grouped.dropna(subset=["iso_alpha3"])
+            unmatched = grouped[grouped["iso_alpha3"].isna()][detected_country_col].tolist()
+
+            if len(mappable) > 0:
+                fig_map = px.choropleth(
+                    mappable,
+                    locations="iso_alpha3",
+                    color=metric_for_map,
+                    hover_name=detected_country_col,
+                    color_continuous_scale="Blues",
+                )
+                fig_map.update_geos(showframe=False, showcoastlines=True)
+                fig_map.update_layout(margin=dict(l=0, r=0, t=0, b=0))
+                st.plotly_chart(fig_map, use_container_width=True)
+                if unmatched:
+                    st.caption(f"Couldn't place on the map (unrecognized country names): {', '.join(map(str, unmatched))}")
+            else:
+                st.info(f"Detected \"{detected_country_col}\" as a country-like column, but couldn't match any values to real countries.")
+
+        if detected_lat_col and detected_lon_col:
+            points = df[[detected_lat_col, detected_lon_col]].dropna()
+            points = points.rename(columns={detected_lat_col: "lat", detected_lon_col: "lon"})
+            points = points[(points["lat"].between(-90, 90)) & (points["lon"].between(-180, 180))]
+            if len(points) > 0:
+                st.map(points)
+            else:
+                st.info(f"Found \"{detected_lat_col}\"/\"{detected_lon_col}\" columns, but no valid coordinate values to plot.")
 
     # ---- Relationship scatter ----
     if len(numeric_cols) >= 2:
