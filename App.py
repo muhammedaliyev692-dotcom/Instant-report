@@ -148,6 +148,90 @@ def count_anomalies(df, col):
     z_scores = (series - series.mean()).abs() / series.std()
     return int((z_scores > 2.5).sum())
 
+
+GRANULARITY_FREQ = {
+    "Daily": "D", "Weekly": "W", "Monthly": "ME",
+    "Quarterly": "QE", "Yearly": "YE",
+}
+
+
+def auto_granularity(dates: pd.Series) -> str:
+    """Pick a sensible default period based on how much date range the file covers."""
+    non_null = dates.dropna()
+    if len(non_null) < 2:
+        return "Monthly"
+    span_days = (non_null.max() - non_null.min()).days
+    if span_days <= 31:
+        return "Daily"
+    elif span_days <= 180:
+        return "Weekly"
+    elif span_days <= 730:
+        return "Monthly"
+    elif span_days <= 365 * 6:
+        return "Quarterly"
+    else:
+        return "Yearly"
+
+
+def format_period(ts: pd.Timestamp, granularity: str) -> str:
+    if granularity == "Daily":
+        return ts.strftime("%b %d, %Y")
+    elif granularity == "Weekly":
+        return "week of " + ts.strftime("%b %d, %Y")
+    elif granularity == "Monthly":
+        return ts.strftime("%B %Y")
+    elif granularity == "Quarterly":
+        return f"Q{((ts.month - 1) // 3) + 1} {ts.year}"
+    else:
+        return str(ts.year)
+
+
+def period_over_period(df, date_col, num_col, granularity, agg="Sum"):
+    """Real calendar-period comparison, e.g. 'August 2026 vs July 2026'.
+
+    Returns a plain-language sentence, or None if there isn't enough date
+    range to compare two full periods. Excludes the most recent period from
+    the comparison if it's only partially covered by data (e.g. the file
+    ends mid-month) — otherwise a partial period looks like a fake decline.
+    """
+    tmp = df[[date_col, num_col]].copy()
+    tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
+    tmp = tmp.dropna(subset=[date_col])
+    if len(tmp) < 2:
+        return None
+    max_actual_date = tmp[date_col].max()
+    freq = GRANULARITY_FREQ[granularity]
+    grouped = tmp.set_index(date_col).resample(freq)[num_col]
+    grouped = grouped.sum() if agg == "Sum" else grouped.mean()
+    grouped = grouped.dropna()
+    if len(grouped) < 2:
+        return None
+
+    partial_note = ""
+    if granularity != "Daily" and len(grouped) >= 1:
+        last_period_end = grouped.index[-1]
+        if last_period_end > max_actual_date:
+            if len(grouped) >= 3:
+                # Drop the incomplete trailing period and compare the two full ones before it
+                grouped = grouped.iloc[:-1]
+                partial_note = " (most recent, still-in-progress period excluded from this comparison)"
+            else:
+                partial_note = " — note: the most recent period is still in progress, so this may look skewed"
+
+    if len(grouped) < 2:
+        return None
+    latest_val, previous_val = grouped.iloc[-1], grouped.iloc[-2]
+    latest_label = format_period(grouped.index[-1], granularity)
+    previous_label = format_period(grouped.index[-2], granularity)
+    if not previous_val:
+        return None
+    change = ((latest_val - previous_val) / previous_val) * 100
+    direction = "up" if change > 1 else "down" if change < -1 else "flat"
+    return (
+        f"{latest_label} vs {previous_label}: {fmt(latest_val)} vs {fmt(previous_val)} "
+        f"({change:+.1f}%, {direction}){partial_note}"
+    )
+
 # ---------------------------------------------------------
 # FILE UPLOAD
 # ---------------------------------------------------------
@@ -235,25 +319,64 @@ if uploaded:
     else:
         st.info("No numeric metric columns detected for this focus.")
 
+    # ---- Shared time-period control (used by Deep Analysis + Trend chart) ----
+    chosen_granularity = None
+    chosen_agg = "Sum"
+    primary_date_col = date_cols[0] if date_cols else None
+    if primary_date_col:
+        st.subheader("Time period")
+        auto_label = auto_granularity(pd.to_datetime(df[primary_date_col], errors="coerce"))
+        granularity_choice = st.selectbox(
+            "Group dates by",
+            ["Auto (recommended)"] + list(GRANULARITY_FREQ.keys()),
+            index=0,
+            key="date_granularity_choice",
+        )
+        chosen_granularity = auto_label if granularity_choice == "Auto (recommended)" else granularity_choice
+        if granularity_choice == "Auto (recommended)":
+            st.caption(f"Automatically grouped by **{chosen_granularity}**, based on the date range in your file.")
+        chosen_agg = st.radio(
+            "Aggregate as", ["Sum", "Average"], horizontal=True, key="date_agg_choice",
+            help="Sum makes sense for things like revenue or flights. Average makes more sense for rates or percentages.",
+        )
+
     # ---- Deep analysis per focus metric ----
     st.subheader("Deep analysis")
     metric_trends = {}  # col -> pct_change, used later for the relationship section
     for col in focus_numeric_cols:
         total = df[col].sum()
         mean = df[col].mean()
-        pct_change = trend_pct(df, col)
-        metric_trends[col] = pct_change
         anomaly_count = count_anomalies(df, col)
 
         with st.expander(f"**{col}**", expanded=True):
-            direction = "trending up" if pct_change > 5 else "trending down" if pct_change < -5 else "holding steady"
             bullets = [
                 f"Total: {fmt(total)}, average {fmt(mean)} per record "
                 f"(range {fmt(df[col].min())}\u2013{fmt(df[col].max())}).",
-                f"{direction.capitalize()}, roughly {fmt(abs(pct_change))}% "
-                f"{'increase' if pct_change > 0 else 'decrease'} from the first half of the file to the second half."
-                if abs(pct_change) > 1 else f"Fairly flat across the file (no meaningful trend detected).",
             ]
+
+            # Prefer a real calendar-period comparison when we have dates;
+            # fall back to the cruder first-half/second-half trend otherwise.
+            pop_text = None
+            if primary_date_col and chosen_granularity:
+                pop_text = period_over_period(df, primary_date_col, col, chosen_granularity, chosen_agg)
+
+            if pop_text:
+                bullets.append(pop_text)
+                # Still track a rough trend number for the relationships section
+                pct_change = trend_pct(df, col)
+                metric_trends[col] = pct_change
+            else:
+                pct_change = trend_pct(df, col)
+                metric_trends[col] = pct_change
+                if abs(pct_change) > 1:
+                    direction = "trending up" if pct_change > 0 else "trending down"
+                    bullets.append(
+                        f"{direction.capitalize()}, roughly {fmt(abs(pct_change))}% "
+                        f"{'increase' if pct_change > 0 else 'decrease'} comparing the first half of the "
+                        f"file's rows to the second half (no usable date column to compare real periods)."
+                    )
+                else:
+                    bullets.append("Fairly flat across the file (no meaningful trend detected).")
 
             # Top / bottom contributor by the first relevant category column
             if focus_category_cols:
@@ -300,24 +423,11 @@ if uploaded:
                 st.markdown(f"- Leadership by {cat_col} differs by metric: {breakdown_text}. No single category dominates everything.")
 
     # ---- Trend chart ----
-    if date_cols and focus_numeric_cols:
+    if date_cols and focus_numeric_cols and chosen_granularity:
         st.subheader("Trend over time")
-
-        col_a, col_b, col_c = st.columns([2, 2, 2])
-        with col_a:
-            trend_chart_type = st.radio(
-                "Chart type", ["Line", "Area", "Bar"], horizontal=True, key="trend_chart_type"
-            )
-        with col_b:
-            granularity_map = {
-                "Daily": "D", "Weekly": "W", "Monthly": "ME",
-                "Quarterly": "QE", "Yearly": "YE",
-            }
-            granularity_label = st.selectbox(
-                "Group dates by", list(granularity_map.keys()), index=2, key="date_granularity"
-            )
-        with col_c:
-            agg_label = st.radio("Aggregate as", ["Sum", "Average"], horizontal=True, key="date_agg")
+        trend_chart_type = st.radio(
+            "Chart type", ["Line", "Area", "Bar"], horizontal=True, key="trend_chart_type"
+        )
 
         date_col = date_cols[0]
         num_col = focus_numeric_cols[0]
@@ -326,15 +436,15 @@ if uploaded:
         chart_df = chart_df.dropna(subset=[date_col]).sort_values(date_col)
 
         if len(chart_df) > 1:
-            freq = granularity_map[granularity_label]
+            freq = GRANULARITY_FREQ[chosen_granularity]
             grouped = chart_df.set_index(date_col).resample(freq)[num_col]
-            grouped = grouped.sum() if agg_label == "Sum" else grouped.mean()
+            grouped = grouped.sum() if chosen_agg == "Sum" else grouped.mean()
             grouped = grouped.reset_index()
 
             if len(grouped) < 2:
                 st.info(
-                    f"Not enough date range in this file to show a {granularity_label.lower()} trend — "
-                    "try a finer grouping (e.g. Daily or Weekly)."
+                    f"Not enough date range in this file to show a {chosen_granularity.lower()} trend — "
+                    "try a finer grouping above (e.g. Daily or Weekly)."
                 )
             else:
                 if trend_chart_type == "Line":
@@ -344,17 +454,6 @@ if uploaded:
                 else:
                     fig = px.bar(grouped, x=date_col, y=num_col)
                 st.plotly_chart(fig, use_container_width=True)
-
-                # Period-over-period comparison: latest complete period vs the one before
-                if len(grouped) >= 2:
-                    latest = grouped[num_col].iloc[-1]
-                    previous = grouped[num_col].iloc[-2]
-                    if previous:
-                        change = ((latest - previous) / previous) * 100
-                        st.caption(
-                            f"Most recent {granularity_label.lower()[:-2] if granularity_label != 'Daily' else 'day'} "
-                            f"vs. previous: {fmt(latest)} vs {fmt(previous)} ({change:+.1f}%)."
-                        )
 
     # ---- Breakdown chart ----
     if focus_category_cols:
