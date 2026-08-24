@@ -112,7 +112,7 @@ if at_limit:
 # HELPERS
 # ---------------------------------------------------------
 ID_NAME_HINTS = re.compile(
-    r"\b(id|code|number|no|num|uid|uuid|flight[_ ]?id|reference|ref)\b",
+    r"(^|[^a-z0-9])(id|code|number|no|num|uid|uuid|reference|ref)([^a-z0-9]|$)",
     re.IGNORECASE,
 )
 
@@ -143,15 +143,37 @@ def looks_like_identifier(series: pd.Series, col_name: str) -> bool:
     return False
 
 
+def looks_like_text_identifier(series: pd.Series, col_name: str) -> bool:
+    """Heuristic: is this text column actually an ID/reference, not a real category?
+
+    Real categories (Product, Region, Payment Method) repeat across many
+    rows. IDs (Order_ID, Transaction_Ref) are almost always unique per row.
+    """
+    if ID_NAME_HINTS.search(str(col_name)):
+        return True
+    non_null = series.dropna().astype(str)
+    if len(non_null) < 10:
+        return False
+    uniqueness = non_null.nunique() / len(non_null)
+    return uniqueness > 0.9
+
+
+def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip BOM markers and stray whitespace some CSV/Excel exports add to headers."""
+    df = df.copy()
+    df.columns = [str(c).replace("\ufeff", "").strip() for c in df.columns]
+    return df
+
+
 def read_any_file(uploaded_file):
     """Reads a CSV or Excel upload. Returns dict of {sheet_name: DataFrame}."""
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file, sep=None, engine="python")
-        return {"Sheet1": df}
+        df = pd.read_csv(uploaded_file, sep=None, engine="python", encoding="utf-8-sig")
+        return {"Sheet1": clean_column_names(df)}
     else:
         xls = pd.ExcelFile(uploaded_file)
-        return {sheet: xls.parse(sheet) for sheet in xls.sheet_names}
+        return {sheet: clean_column_names(xls.parse(sheet)) for sheet in xls.sheet_names}
 
 
 def fmt(n):
@@ -174,8 +196,13 @@ def trend_pct(df, col):
 
 
 def top_bottom_by_category(df, num_col, cat_col):
-    """Which category leads and which trails for this metric, and by how much."""
-    grouped = df.groupby(cat_col)[num_col].sum().sort_values(ascending=False)
+    """Which category leads and which trails for this metric, and by how much.
+
+    Uses min_count=1 so a category whose values are all missing shows up as
+    NaN (and gets dropped) rather than silently being summed to a
+    misleading 0 — which previously made real minimums look wrong.
+    """
+    grouped = df.groupby(cat_col)[num_col].sum(min_count=1).dropna().sort_values(ascending=False)
     if len(grouped) == 0:
         return None
     return {
@@ -232,13 +259,11 @@ def format_period(ts: pd.Timestamp, granularity: str) -> str:
         return str(ts.year)
 
 
-def period_over_period(df, date_col, num_col, granularity, agg="Sum"):
-    """Real calendar-period comparison, e.g. 'August 2026 vs July 2026'.
-
-    Returns a plain-language sentence, or None if there isn't enough date
-    range to compare two full periods. Excludes the most recent period from
-    the comparison if it's only partially covered by data (e.g. the file
-    ends mid-month) — otherwise a partial period looks like a fake decline.
+def period_over_period_value(df, date_col, num_col, granularity, agg="Sum"):
+    """Core calendar-period comparison logic. Returns a dict with the raw
+    numbers and labels, or None if there isn't enough date range to compare
+    two full periods. Both the metric-card tooltip and the Deep Analysis
+    sentence are built from this same calculation, so they never disagree.
     """
     tmp = df[[date_col, num_col]].copy()
     tmp[date_col] = pd.to_datetime(tmp[date_col], errors="coerce")
@@ -253,16 +278,15 @@ def period_over_period(df, date_col, num_col, granularity, agg="Sum"):
     if len(grouped) < 2:
         return None
 
-    partial_note = ""
+    partial = False
     if granularity != "Daily" and len(grouped) >= 1:
         last_period_end = grouped.index[-1]
         if last_period_end > max_actual_date:
             if len(grouped) >= 3:
-                # Drop the incomplete trailing period and compare the two full ones before it
                 grouped = grouped.iloc[:-1]
-                partial_note = " (most recent, still-in-progress period excluded from this comparison)"
+                partial = True
             else:
-                partial_note = " — note: the most recent period is still in progress, so this may look skewed"
+                partial = True  # can't drop, only 2 periods — flag it instead
 
     if len(grouped) < 2:
         return None
@@ -272,10 +296,36 @@ def period_over_period(df, date_col, num_col, granularity, agg="Sum"):
     if not previous_val:
         return None
     change = ((latest_val - previous_val) / previous_val) * 100
-    direction = "up" if change > 1 else "down" if change < -1 else "flat"
+    return {
+        "change": change,
+        "latest_val": latest_val,
+        "previous_val": previous_val,
+        "latest_label": latest_label,
+        "previous_label": previous_label,
+        "partial": partial,
+        "granularity": granularity,
+        "agg": agg,
+    }
+
+
+def period_over_period(df, date_col, num_col, granularity, agg="Sum"):
+    """Real calendar-period comparison, e.g. 'August 2026 vs July 2026'.
+
+    Returns a plain-language sentence, or None if there isn't enough date
+    range to compare two full periods. Excludes the most recent period from
+    the comparison if it's only partially covered by data (e.g. the file
+    ends mid-month) — otherwise a partial period looks like a fake decline.
+    """
+    pv = period_over_period_value(df, date_col, num_col, granularity, agg)
+    if not pv:
+        return None
+    partial_note = ""
+    if pv["partial"]:
+        partial_note = " (most recent, still-in-progress period excluded from this comparison)"
+    direction = "up" if pv["change"] > 1 else "down" if pv["change"] < -1 else "flat"
     return (
-        f"{latest_label} vs {previous_label}: {fmt(latest_val)} vs {fmt(previous_val)} "
-        f"({change:+.1f}%, {direction}){partial_note}"
+        f"{pv['latest_label']} vs {pv['previous_label']}: {fmt(pv['latest_val'])} vs {fmt(pv['previous_val'])} "
+        f"({pv['change']:+.1f}%, {direction}){partial_note}"
     )
 
 # ---------------------------------------------------------
@@ -326,13 +376,16 @@ if uploaded:
         except Exception:
             pass
 
-    category_cols = [
+    category_cols_raw = [
         c for c in df.columns
         if c not in raw_numeric_cols and c not in date_cols
     ]
+    text_id_cols = [c for c in category_cols_raw if looks_like_text_identifier(df[c], c)]
+    category_cols = [c for c in category_cols_raw if c not in text_id_cols]
 
-    if id_cols:
-        st.caption(f"Excluded from stats as likely ID columns: {', '.join(id_cols)}")
+    all_id_cols = id_cols + text_id_cols
+    if all_id_cols:
+        st.caption(f"Excluded as likely ID/reference columns (not real metrics or categories): {', '.join(all_id_cols)}")
 
     # ---- Focus selection ----
     # Build a simple menu of what the client could focus on, based purely on
@@ -353,19 +406,7 @@ if uploaded:
         focus_numeric_cols = [c for c in chosen_focus if c in numeric_cols] or numeric_cols
         focus_category_cols = [c for c in chosen_focus if c in category_cols] or category_cols
 
-    # ---- Key metrics ----
-    if focus_numeric_cols:
-        st.subheader("Key metrics")
-        cols = st.columns(min(4, len(focus_numeric_cols)))
-        for i, col in enumerate(focus_numeric_cols[:4]):
-            total = df[col].sum()
-            pct_change = trend_pct(df, col)
-            with cols[i]:
-                st.metric(col, fmt(total), f"{pct_change:+.1f}%")
-    else:
-        st.info("No numeric metric columns detected for this focus.")
-
-    # ---- Shared time-period control (used by Deep Analysis + Trend chart) ----
+    # ---- Shared time-period control (used by Key Metrics, Deep Analysis, and the Trend chart) ----
     chosen_granularity = None
     chosen_agg = "Sum"
     primary_date_col = date_cols[0] if date_cols else None
@@ -385,6 +426,40 @@ if uploaded:
             "Aggregate as", ["Sum", "Average"], horizontal=True, key="date_agg_choice",
             help="Sum makes sense for things like revenue or flights. Average makes more sense for rates or percentages.",
         )
+
+    # ---- Key metrics ----
+    if focus_numeric_cols:
+        st.subheader("Key metrics")
+        cols = st.columns(min(4, len(focus_numeric_cols)))
+        for i, col in enumerate(focus_numeric_cols[:4]):
+            total = df[col].sum()
+
+            # Prefer a real calendar-period comparison; fall back to the
+            # cruder first-half/second-half trend if there's no usable date.
+            pv = None
+            if primary_date_col and chosen_granularity:
+                pv = period_over_period_value(df, primary_date_col, col, chosen_granularity, chosen_agg)
+
+            if pv:
+                pct_change = pv["change"]
+                tooltip = (
+                    f"{pv['granularity']} comparison ({pv['agg'].lower()}): "
+                    f"{pv['latest_label']} = {fmt(pv['latest_val'])}, "
+                    f"{pv['previous_label']} = {fmt(pv['previous_val'])}."
+                )
+                if pv["partial"]:
+                    tooltip += " Most recent, still-in-progress period was excluded from this comparison."
+            else:
+                pct_change = trend_pct(df, col)
+                tooltip = (
+                    "No usable date column to compare real time periods, so this compares the "
+                    "average of the first half of the file's rows to the average of the second half."
+                )
+
+            with cols[i]:
+                st.metric(col, fmt(total), f"{pct_change:+.1f}%", help=tooltip)
+    else:
+        st.info("No numeric metric columns detected for this focus.")
 
     # ---- Deep analysis per focus metric ----
     st.subheader("Deep analysis")
@@ -547,8 +622,6 @@ if uploaded:
             st.plotly_chart(fig4, use_container_width=True)
 
     # ---- Closing note ----
-    if id_cols:
-        st.caption(f"Columns treated as identifiers, not metrics: {', '.join(id_cols)}")
 
 # ---------------------------------------------------------
 # NOTES
