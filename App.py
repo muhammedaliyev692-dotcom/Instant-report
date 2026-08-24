@@ -32,8 +32,16 @@ st.markdown("""
         border-radius: 6px;
         padding: 14px 16px 10px;
     }
-    [data-testid="stMetricLabel"] { color: #4A5568; font-weight: 600; }
-    [data-testid="stMetricValue"] { color: #1B3A5C; }
+    [data-testid="stMetricLabel"] { color: #4A5568; font-weight: 600; overflow: visible; }
+    [data-testid="stMetricValue"] {
+        color: #1B3A5C;
+        white-space: normal;
+        overflow: visible;
+        text-overflow: unset;
+        word-break: break-word;
+        font-size: 1.5rem;
+        line-height: 1.3;
+    }
     .streamlit-expanderHeader {
         background: #F4F6F9;
         border-radius: 4px;
@@ -460,8 +468,8 @@ if uploaded:
     # ---- Key metrics ----
     if focus_numeric_cols:
         st.subheader("Key metrics")
-        cols = st.columns(min(4, len(focus_numeric_cols)))
-        for i, col in enumerate(focus_numeric_cols[:4]):
+        cols = st.columns(min(3, len(focus_numeric_cols)))
+        for i, col in enumerate(focus_numeric_cols[:3]):
             total = df[col].sum()
 
             # Prefer a real calendar-period comparison; fall back to the
