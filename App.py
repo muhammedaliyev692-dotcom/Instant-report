@@ -302,22 +302,59 @@ if uploaded:
     # ---- Trend chart ----
     if date_cols and focus_numeric_cols:
         st.subheader("Trend over time")
-        trend_chart_type = st.radio(
-            "Chart type", ["Line", "Area", "Bar"], horizontal=True, key="trend_chart_type"
-        )
+
+        col_a, col_b, col_c = st.columns([2, 2, 2])
+        with col_a:
+            trend_chart_type = st.radio(
+                "Chart type", ["Line", "Area", "Bar"], horizontal=True, key="trend_chart_type"
+            )
+        with col_b:
+            granularity_map = {
+                "Daily": "D", "Weekly": "W", "Monthly": "ME",
+                "Quarterly": "QE", "Yearly": "YE",
+            }
+            granularity_label = st.selectbox(
+                "Group dates by", list(granularity_map.keys()), index=2, key="date_granularity"
+            )
+        with col_c:
+            agg_label = st.radio("Aggregate as", ["Sum", "Average"], horizontal=True, key="date_agg")
+
         date_col = date_cols[0]
         num_col = focus_numeric_cols[0]
         chart_df = df[[date_col, num_col]].copy()
         chart_df[date_col] = pd.to_datetime(chart_df[date_col], errors="coerce")
-        chart_df = chart_df.dropna().sort_values(date_col)
+        chart_df = chart_df.dropna(subset=[date_col]).sort_values(date_col)
+
         if len(chart_df) > 1:
-            if trend_chart_type == "Line":
-                fig = px.line(chart_df, x=date_col, y=num_col)
-            elif trend_chart_type == "Area":
-                fig = px.area(chart_df, x=date_col, y=num_col)
+            freq = granularity_map[granularity_label]
+            grouped = chart_df.set_index(date_col).resample(freq)[num_col]
+            grouped = grouped.sum() if agg_label == "Sum" else grouped.mean()
+            grouped = grouped.reset_index()
+
+            if len(grouped) < 2:
+                st.info(
+                    f"Not enough date range in this file to show a {granularity_label.lower()} trend — "
+                    "try a finer grouping (e.g. Daily or Weekly)."
+                )
             else:
-                fig = px.bar(chart_df, x=date_col, y=num_col)
-            st.plotly_chart(fig, use_container_width=True)
+                if trend_chart_type == "Line":
+                    fig = px.line(grouped, x=date_col, y=num_col, markers=len(grouped) <= 60)
+                elif trend_chart_type == "Area":
+                    fig = px.area(grouped, x=date_col, y=num_col)
+                else:
+                    fig = px.bar(grouped, x=date_col, y=num_col)
+                st.plotly_chart(fig, use_container_width=True)
+
+                # Period-over-period comparison: latest complete period vs the one before
+                if len(grouped) >= 2:
+                    latest = grouped[num_col].iloc[-1]
+                    previous = grouped[num_col].iloc[-2]
+                    if previous:
+                        change = ((latest - previous) / previous) * 100
+                        st.caption(
+                            f"Most recent {granularity_label.lower()[:-2] if granularity_label != 'Daily' else 'day'} "
+                            f"vs. previous: {fmt(latest)} vs {fmt(previous)} ({change:+.1f}%)."
+                        )
 
     # ---- Breakdown chart ----
     if focus_category_cols:
