@@ -396,6 +396,22 @@ if uploaded:
     if all_id_cols:
         st.caption(f"Excluded as likely ID/reference columns (not real metrics or categories): {', '.join(all_id_cols)}")
 
+    # ---- Instant overview: totals & averages for every real numeric column ----
+    # Shown immediately, before any focus is picked, so you see the full
+    # picture of what's in the file first.
+    if numeric_cols:
+        st.subheader("Overview")
+        overview_rows = []
+        for c in numeric_cols:
+            overview_rows.append({
+                "Column": c,
+                "Total": fmt(df[c].sum()),
+                "Average": fmt(df[c].mean()),
+                "Min": fmt(df[c].min()),
+                "Max": fmt(df[c].max()),
+            })
+        st.dataframe(pd.DataFrame(overview_rows), hide_index=True, use_container_width=True)
+
     # ---- Focus selection ----
     # Build a simple menu of what the client could focus on, based purely on
     # what columns actually exist in this file — no AI involved, just the
@@ -418,7 +434,12 @@ if uploaded:
     # ---- Shared time-period control (used by Key Metrics, Deep Analysis, and the Trend chart) ----
     chosen_granularity = None
     chosen_agg = "Sum"
-    primary_date_col = date_cols[0] if date_cols else None
+    if len(date_cols) > 1:
+        primary_date_col = st.selectbox(
+            "Which date column should drive the trend analysis?", date_cols, key="primary_date_col"
+        )
+    else:
+        primary_date_col = date_cols[0] if date_cols else None
     if primary_date_col:
         st.subheader("Time period")
         auto_label = auto_granularity(pd.to_datetime(df[primary_date_col], errors="coerce"))
@@ -590,15 +611,31 @@ if uploaded:
 
     # ---- Breakdown chart ----
     if focus_category_cols:
-        st.subheader(f"Breakdown by {focus_category_cols[0]}")
+        st.subheader("Breakdown")
+        col_a, col_b = st.columns([2, 3])
+        with col_a:
+            if len(focus_category_cols) > 1:
+                cat_col = st.selectbox("Break down by", focus_category_cols, key="breakdown_cat_col")
+            else:
+                cat_col = focus_category_cols[0]
+                st.caption(f"Breaking down by **{cat_col}**")
+        with col_b:
+            if len(focus_numeric_cols) > 1:
+                metric_for_breakdown = st.selectbox(
+                    "Measured by", focus_numeric_cols, key="breakdown_metric_col"
+                )
+            elif focus_numeric_cols:
+                metric_for_breakdown = focus_numeric_cols[0]
+            else:
+                metric_for_breakdown = None
+
         breakdown_chart_type = st.radio(
             "Chart type", ["Bar", "Horizontal bar", "Pie", "Donut", "Line"],
             horizontal=True, key="breakdown_chart_type"
         )
-        cat_col = focus_category_cols[0]
-        if focus_numeric_cols:
-            breakdown = df.groupby(cat_col)[focus_numeric_cols[0]].sum().sort_values(ascending=False).head(10)
-            y_label = focus_numeric_cols[0]
+        if metric_for_breakdown:
+            breakdown = df.groupby(cat_col)[metric_for_breakdown].sum().sort_values(ascending=False).head(10)
+            y_label = metric_for_breakdown
         else:
             breakdown = df[cat_col].value_counts().head(10)
             y_label = "Count"
@@ -617,19 +654,22 @@ if uploaded:
             fig2 = px.line(breakdown_df, x=cat_col, y=y_label, markers=True)
         st.plotly_chart(fig2, use_container_width=True)
 
-    # ---- Relationship scatter (only when 2+ metrics are selected) ----
-    if len(focus_numeric_cols) >= 2:
+    # ---- Relationship scatter ----
+    if len(numeric_cols) >= 2:
         st.subheader("Relationship between two metrics")
-        col_x = st.selectbox("X axis", focus_numeric_cols, index=0, key="scatter_x")
-        col_y = st.selectbox("Y axis", focus_numeric_cols, index=1, key="scatter_y")
+        st.caption("Not limited to your focus picks — compare any two numeric columns in the file.")
+        col_x = st.selectbox("X axis", numeric_cols, index=0, key="scatter_x")
+        col_y = st.selectbox(
+            "Y axis", numeric_cols, index=1 if len(numeric_cols) > 1 else 0, key="scatter_y"
+        )
         color_arg = focus_category_cols[0] if focus_category_cols else None
         fig3 = px.scatter(df, x=col_x, y=col_y, color=color_arg, trendline=None)
         st.plotly_chart(fig3, use_container_width=True)
 
-    # ---- Distribution (histogram) for any selected metric ----
-    if focus_numeric_cols:
-        with st.expander("Distribution of a metric (histogram)"):
-            hist_col = st.selectbox("Column", focus_numeric_cols, key="hist_col")
+    # ---- Distribution (histogram) for any numeric column ----
+    if numeric_cols:
+        with st.expander("Distribution of a column (histogram)"):
+            hist_col = st.selectbox("Column", numeric_cols, key="hist_col")
             fig4 = px.histogram(df, x=hist_col, nbins=30)
             st.plotly_chart(fig4, use_container_width=True)
 
