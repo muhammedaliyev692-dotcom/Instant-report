@@ -76,7 +76,7 @@ uploaded = st.file_uploader("Upload a CSV file", type=["csv"])
 
 if uploaded:
     try:
-        df = pd.read_csv(uploaded)
+        df = pd.read_csv(uploaded, sep=None, engine="python")
     except Exception as e:
         st.error(f"Couldn't read that file: {e}")
         st.stop()
