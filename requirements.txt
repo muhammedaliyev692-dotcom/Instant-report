@@ -2,3 +2,4 @@ streamlit
 pandas>=2.2
 plotly
 openpyxl
+pycountry
