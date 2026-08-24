@@ -157,11 +157,30 @@ if uploaded:
     if id_cols:
         st.caption(f"Excluded from stats as likely ID columns: {', '.join(id_cols)}")
 
+    # ---- Focus selection ----
+    # Build a simple menu of what the client could focus on, based purely on
+    # what columns actually exist in this file — no AI involved, just the
+    # column classification we already did above.
+    focus_options = ["Overall overview"] + numeric_cols + category_cols
+    st.subheader("What would you like to focus on?")
+    chosen_focus = st.multiselect(
+        "Pick one or more areas (leave as Overall overview to see everything)",
+        options=focus_options,
+        default=["Overall overview"],
+    )
+
+    if not chosen_focus or "Overall overview" in chosen_focus:
+        focus_numeric_cols = numeric_cols
+        focus_category_cols = category_cols
+    else:
+        focus_numeric_cols = [c for c in chosen_focus if c in numeric_cols] or numeric_cols
+        focus_category_cols = [c for c in chosen_focus if c in category_cols] or category_cols
+
     # ---- Key metrics ----
-    if numeric_cols:
+    if focus_numeric_cols:
         st.subheader("Key metrics")
-        cols = st.columns(min(4, len(numeric_cols)))
-        for i, col in enumerate(numeric_cols[:4]):
+        cols = st.columns(min(4, len(focus_numeric_cols)))
+        for i, col in enumerate(focus_numeric_cols[:4]):
             total = df[col].sum()
             half = len(df) // 2
             first_half_mean = df[col].iloc[:half].mean() if half > 0 else df[col].mean()
@@ -173,13 +192,13 @@ if uploaded:
             with cols[i]:
                 st.metric(col, fmt(total), f"{pct_change:+.1f}%")
     else:
-        st.info("No numeric metric columns detected (after excluding likely ID columns).")
+        st.info("No numeric metric columns detected for this focus.")
 
     # ---- Trend chart ----
-    if date_cols and numeric_cols:
+    if date_cols and focus_numeric_cols:
         st.subheader("Trend over time")
         date_col = date_cols[0]
-        num_col = numeric_cols[0]
+        num_col = focus_numeric_cols[0]
         chart_df = df[[date_col, num_col]].copy()
         chart_df[date_col] = pd.to_datetime(chart_df[date_col], errors="coerce")
         chart_df = chart_df.dropna().sort_values(date_col)
@@ -188,11 +207,11 @@ if uploaded:
             st.plotly_chart(fig, use_container_width=True)
 
     # ---- Breakdown chart ----
-    if category_cols:
-        st.subheader(f"Breakdown by {category_cols[0]}")
-        cat_col = category_cols[0]
-        if numeric_cols:
-            breakdown = df.groupby(cat_col)[numeric_cols[0]].sum().sort_values(ascending=False).head(6)
+    if focus_category_cols:
+        st.subheader(f"Breakdown by {focus_category_cols[0]}")
+        cat_col = focus_category_cols[0]
+        if focus_numeric_cols:
+            breakdown = df.groupby(cat_col)[focus_numeric_cols[0]].sum().sort_values(ascending=False).head(6)
         else:
             breakdown = df[cat_col].value_counts().head(6)
         fig2 = px.pie(values=breakdown.values, names=breakdown.index)
@@ -201,16 +220,16 @@ if uploaded:
     # ---- Narrative summary ----
     st.subheader("Summary")
     lines = [f"This file contains {len(df):,} records across {len(df.columns)} fields."]
-    for col in numeric_cols:
+    for col in focus_numeric_cols:
         total = df[col].sum()
         mean = df[col].mean()
         lines.append(
             f"- **{col}**: total {fmt(total)}, averaging {fmt(mean)} per record "
             f"(range {fmt(df[col].min())}\u2013{fmt(df[col].max())})."
         )
-    if category_cols and numeric_cols:
-        top = df.groupby(category_cols[0])[numeric_cols[0]].sum().idxmax()
-        lines.append(f"- By **{category_cols[0]}**, \"{top}\" leads the totals.")
+    if focus_category_cols and focus_numeric_cols:
+        top = df.groupby(focus_category_cols[0])[focus_numeric_cols[0]].sum().idxmax()
+        lines.append(f"- By **{focus_category_cols[0]}**, \"{top}\" leads the totals.")
     if id_cols:
         lines.append(f"- Columns treated as identifiers (not averaged): {', '.join(id_cols)}.")
     st.markdown("\n".join(lines))
