@@ -71,16 +71,29 @@ ID_NAME_HINTS = re.compile(
 )
 
 def looks_like_identifier(series: pd.Series, col_name: str) -> bool:
-    """Heuristic: is this numeric column actually an ID, not a real metric?"""
+    """Heuristic: is this numeric column actually an ID, not a real metric?
+
+    Name hints are the primary signal. As a fallback, only treat a column as
+    an ID if its values look like a sequential code (e.g. 1, 2, 3...) —
+    being "mostly unique" alone isn't enough, since real metrics like
+    revenue or fuel volume are often unique per row too.
+    """
     if ID_NAME_HINTS.search(str(col_name)):
         return True
     non_null = series.dropna()
-    if len(non_null) == 0:
+    if len(non_null) < 6:
         return False
     is_integer_like = (non_null == non_null.round()).mean() > 0.98
     uniqueness = non_null.nunique() / len(non_null)
-    if is_integer_like and uniqueness > 0.9 and len(non_null) > 5:
-        return True
+    if not (is_integer_like and uniqueness > 0.95):
+        return False
+    # Check whether sorted unique values increase in small, near-constant
+    # steps — the signature of a sequential ID, not a real-world metric.
+    sorted_vals = non_null.sort_values().unique()
+    if len(sorted_vals) > 5:
+        diffs = pd.Series(sorted_vals).diff().dropna()
+        if len(diffs) > 0 and diffs.mean() > 0 and diffs.mean() <= 10 and diffs.std() < diffs.mean() * 0.5 + 0.5:
+            return True
     return False
 
 
@@ -100,6 +113,40 @@ def fmt(n):
         return f"{n:,.1f}"
     except Exception:
         return str(n)
+
+
+def trend_pct(df, col):
+    """% change between the first half and second half of the file for this column."""
+    half = len(df) // 2
+    if half == 0:
+        return 0.0
+    first_half_mean = df[col].iloc[:half].mean()
+    second_half_mean = df[col].iloc[half:].mean()
+    if not first_half_mean:
+        return 0.0
+    return ((second_half_mean - first_half_mean) / first_half_mean) * 100
+
+
+def top_bottom_by_category(df, num_col, cat_col):
+    """Which category leads and which trails for this metric, and by how much."""
+    grouped = df.groupby(cat_col)[num_col].sum().sort_values(ascending=False)
+    if len(grouped) == 0:
+        return None
+    return {
+        "top_name": grouped.index[0],
+        "top_value": grouped.iloc[0],
+        "bottom_name": grouped.index[-1],
+        "bottom_value": grouped.iloc[-1],
+    }
+
+
+def count_anomalies(df, col):
+    """Simple outlier count: values more than 2.5 standard deviations from the mean."""
+    series = df[col].dropna()
+    if len(series) < 5 or series.std() == 0:
+        return 0
+    z_scores = (series - series.mean()).abs() / series.std()
+    return int((z_scores > 2.5).sum())
 
 # ---------------------------------------------------------
 # FILE UPLOAD
@@ -182,57 +229,144 @@ if uploaded:
         cols = st.columns(min(4, len(focus_numeric_cols)))
         for i, col in enumerate(focus_numeric_cols[:4]):
             total = df[col].sum()
-            half = len(df) // 2
-            first_half_mean = df[col].iloc[:half].mean() if half > 0 else df[col].mean()
-            second_half_mean = df[col].iloc[half:].mean() if half > 0 else df[col].mean()
-            pct_change = (
-                ((second_half_mean - first_half_mean) / first_half_mean * 100)
-                if first_half_mean else 0
-            )
+            pct_change = trend_pct(df, col)
             with cols[i]:
                 st.metric(col, fmt(total), f"{pct_change:+.1f}%")
     else:
         st.info("No numeric metric columns detected for this focus.")
 
+    # ---- Deep analysis per focus metric ----
+    st.subheader("Deep analysis")
+    metric_trends = {}  # col -> pct_change, used later for the relationship section
+    for col in focus_numeric_cols:
+        total = df[col].sum()
+        mean = df[col].mean()
+        pct_change = trend_pct(df, col)
+        metric_trends[col] = pct_change
+        anomaly_count = count_anomalies(df, col)
+
+        with st.expander(f"**{col}**", expanded=True):
+            direction = "trending up" if pct_change > 5 else "trending down" if pct_change < -5 else "holding steady"
+            bullets = [
+                f"Total: {fmt(total)}, average {fmt(mean)} per record "
+                f"(range {fmt(df[col].min())}\u2013{fmt(df[col].max())}).",
+                f"{direction.capitalize()}, roughly {fmt(abs(pct_change))}% "
+                f"{'increase' if pct_change > 0 else 'decrease'} from the first half of the file to the second half."
+                if abs(pct_change) > 1 else f"Fairly flat across the file (no meaningful trend detected).",
+            ]
+
+            # Top / bottom contributor by the first relevant category column
+            if focus_category_cols:
+                tb = top_bottom_by_category(df, col, focus_category_cols[0])
+                if tb and tb["top_name"] != tb["bottom_name"]:
+                    bullets.append(
+                        f"By **{focus_category_cols[0]}**: \"{tb['top_name']}\" leads with {fmt(tb['top_value'])}, "
+                        f"while \"{tb['bottom_name']}\" trails at {fmt(tb['bottom_value'])}."
+                    )
+
+            if anomaly_count > 0:
+                bullets.append(
+                    f"⚠️ {anomaly_count} unusual value{'s' if anomaly_count != 1 else ''} detected "
+                    f"(far outside the normal range for this column) — worth a manual look."
+                )
+
+            for b in bullets:
+                st.markdown(f"- {b}")
+
+    # ---- Relationships between selected metrics ----
+    if len(focus_numeric_cols) > 1:
+        st.subheader("Relationships between what you selected")
+        rel_lines = []
+        for col, pct in metric_trends.items():
+            rel_lines.append(f"**{col}** moved {pct:+.1f}%")
+        rel_lines_sorted = sorted(metric_trends.items(), key=lambda x: x[1], reverse=True)
+        fastest = rel_lines_sorted[0]
+        slowest = rel_lines_sorted[-1]
+        st.markdown(
+            f"- Across your selected metrics: {', '.join(rel_lines)} over the file's timespan.\n"
+            f"- **{fastest[0]}** grew fastest ({fastest[1]:+.1f}%), while **{slowest[0]}** grew slowest or declined most ({slowest[1]:+.1f}%). "
+            f"That gap is often where the real story is — e.g. costs rising faster than revenue, or flights increasing without matching profit."
+        )
+        if focus_category_cols:
+            cat_col = focus_category_cols[0]
+            leaders = {col: top_bottom_by_category(df, col, cat_col) for col in focus_numeric_cols}
+            leader_names = {col: tb["top_name"] for col, tb in leaders.items() if tb}
+            unique_leaders = set(leader_names.values())
+            if len(unique_leaders) == 1:
+                only_leader = list(unique_leaders)[0]
+                st.markdown(f"- \"{only_leader}\" leads on every selected metric by {cat_col} — a consistent top performer.")
+            elif len(unique_leaders) > 1:
+                breakdown_text = "; ".join(f"{col} → \"{name}\"" for col, name in leader_names.items())
+                st.markdown(f"- Leadership by {cat_col} differs by metric: {breakdown_text}. No single category dominates everything.")
+
     # ---- Trend chart ----
     if date_cols and focus_numeric_cols:
         st.subheader("Trend over time")
+        trend_chart_type = st.radio(
+            "Chart type", ["Line", "Area", "Bar"], horizontal=True, key="trend_chart_type"
+        )
         date_col = date_cols[0]
         num_col = focus_numeric_cols[0]
         chart_df = df[[date_col, num_col]].copy()
         chart_df[date_col] = pd.to_datetime(chart_df[date_col], errors="coerce")
         chart_df = chart_df.dropna().sort_values(date_col)
         if len(chart_df) > 1:
-            fig = px.line(chart_df, x=date_col, y=num_col)
+            if trend_chart_type == "Line":
+                fig = px.line(chart_df, x=date_col, y=num_col)
+            elif trend_chart_type == "Area":
+                fig = px.area(chart_df, x=date_col, y=num_col)
+            else:
+                fig = px.bar(chart_df, x=date_col, y=num_col)
             st.plotly_chart(fig, use_container_width=True)
 
     # ---- Breakdown chart ----
     if focus_category_cols:
         st.subheader(f"Breakdown by {focus_category_cols[0]}")
+        breakdown_chart_type = st.radio(
+            "Chart type", ["Bar", "Horizontal bar", "Pie", "Donut", "Line"],
+            horizontal=True, key="breakdown_chart_type"
+        )
         cat_col = focus_category_cols[0]
         if focus_numeric_cols:
-            breakdown = df.groupby(cat_col)[focus_numeric_cols[0]].sum().sort_values(ascending=False).head(6)
+            breakdown = df.groupby(cat_col)[focus_numeric_cols[0]].sum().sort_values(ascending=False).head(10)
+            y_label = focus_numeric_cols[0]
         else:
-            breakdown = df[cat_col].value_counts().head(6)
-        fig2 = px.pie(values=breakdown.values, names=breakdown.index)
+            breakdown = df[cat_col].value_counts().head(10)
+            y_label = "Count"
+        breakdown_df = breakdown.reset_index()
+        breakdown_df.columns = [cat_col, y_label]
+
+        if breakdown_chart_type == "Bar":
+            fig2 = px.bar(breakdown_df, x=cat_col, y=y_label)
+        elif breakdown_chart_type == "Horizontal bar":
+            fig2 = px.bar(breakdown_df.sort_values(y_label), x=y_label, y=cat_col, orientation="h")
+        elif breakdown_chart_type == "Pie":
+            fig2 = px.pie(breakdown_df, values=y_label, names=cat_col)
+        elif breakdown_chart_type == "Donut":
+            fig2 = px.pie(breakdown_df, values=y_label, names=cat_col, hole=0.5)
+        else:  # Line
+            fig2 = px.line(breakdown_df, x=cat_col, y=y_label, markers=True)
         st.plotly_chart(fig2, use_container_width=True)
 
-    # ---- Narrative summary ----
-    st.subheader("Summary")
-    lines = [f"This file contains {len(df):,} records across {len(df.columns)} fields."]
-    for col in focus_numeric_cols:
-        total = df[col].sum()
-        mean = df[col].mean()
-        lines.append(
-            f"- **{col}**: total {fmt(total)}, averaging {fmt(mean)} per record "
-            f"(range {fmt(df[col].min())}\u2013{fmt(df[col].max())})."
-        )
-    if focus_category_cols and focus_numeric_cols:
-        top = df.groupby(focus_category_cols[0])[focus_numeric_cols[0]].sum().idxmax()
-        lines.append(f"- By **{focus_category_cols[0]}**, \"{top}\" leads the totals.")
+    # ---- Relationship scatter (only when 2+ metrics are selected) ----
+    if len(focus_numeric_cols) >= 2:
+        st.subheader("Relationship between two metrics")
+        col_x = st.selectbox("X axis", focus_numeric_cols, index=0, key="scatter_x")
+        col_y = st.selectbox("Y axis", focus_numeric_cols, index=1, key="scatter_y")
+        color_arg = focus_category_cols[0] if focus_category_cols else None
+        fig3 = px.scatter(df, x=col_x, y=col_y, color=color_arg, trendline=None)
+        st.plotly_chart(fig3, use_container_width=True)
+
+    # ---- Distribution (histogram) for any selected metric ----
+    if focus_numeric_cols:
+        with st.expander("Distribution of a metric (histogram)"):
+            hist_col = st.selectbox("Column", focus_numeric_cols, key="hist_col")
+            fig4 = px.histogram(df, x=hist_col, nbins=30)
+            st.plotly_chart(fig4, use_container_width=True)
+
+    # ---- Closing note ----
     if id_cols:
-        lines.append(f"- Columns treated as identifiers (not averaged): {', '.join(id_cols)}.")
-    st.markdown("\n".join(lines))
+        st.caption(f"Columns treated as identifiers, not metrics: {', '.join(id_cols)}")
 
 # ---------------------------------------------------------
 # NOTES
