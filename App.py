@@ -16,6 +16,52 @@ UNLOCK_CODE = "UNLOCK2026"  # swap for real codes once payments are wired up
 st.set_page_config(page_title="Instant Report", page_icon="📊", layout="centered")
 
 # ---------------------------------------------------------
+# STYLE (navy / white, professional look)
+# ---------------------------------------------------------
+# Most of the theme (background, primary color, font) is set in
+# .streamlit/config.toml. This adds a few polish touches Streamlit's
+# built-in theming can't reach on its own.
+st.markdown("""
+<style>
+    .main .block-container { padding-top: 2.5rem; max-width: 780px; }
+    h1 { color: #1B3A5C; font-weight: 700; letter-spacing: -0.01em; }
+    h2, h3 { color: #1B3A5C; font-weight: 600; }
+    [data-testid="stMetric"] {
+        background: #F4F6F9;
+        border: 1px solid #E1E6ED;
+        border-radius: 6px;
+        padding: 14px 16px 10px;
+    }
+    [data-testid="stMetricLabel"] { color: #4A5568; font-weight: 600; }
+    [data-testid="stMetricValue"] { color: #1B3A5C; }
+    .streamlit-expanderHeader {
+        background: #F4F6F9;
+        border-radius: 4px;
+        font-weight: 600;
+        color: #1B3A5C;
+    }
+    div[data-testid="stFileUploader"] {
+        border: 1.5px dashed #C3CDDA;
+        border-radius: 6px;
+        padding: 4px;
+        background: #FAFBFC;
+    }
+    .stButton button, .stDownloadButton button {
+        background-color: #1B3A5C;
+        color: #FFFFFF;
+        border-radius: 4px;
+        border: none;
+        font-weight: 600;
+    }
+    .stButton button:hover, .stDownloadButton button:hover {
+        background-color: #14293F;
+        color: #FFFFFF;
+    }
+    hr { border-color: #E1E6ED; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------------------------------------------------------
 # USAGE TRACKING
 # ---------------------------------------------------------
 # NOTE: this now tracks usage per browser session (st.session_state),
