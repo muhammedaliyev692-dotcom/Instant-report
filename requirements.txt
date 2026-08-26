@@ -1,5 +1,6 @@
 streamlit
-pandas>=2.2
+pandas
 plotly
 openpyxl
+xlrd
 pycountry
