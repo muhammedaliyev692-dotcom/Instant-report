@@ -167,6 +167,249 @@ def looks_like_text_identifier(series: pd.Series, col_name: str) -> bool:
     return uniqueness > 0.9
 
 
+# ---------------------------------------------------------
+# ANALYTICAL CLASSIFICATION (deterministic, no AI/LLM)
+# ---------------------------------------------------------
+# The core principle: don't calculate something just because it's
+# mathematically possible. A column's business meaning determines whether
+# it should be summed, averaged, or left alone (percentages, identifiers).
+def _norm(name) -> str:
+    s = re.sub(r"[^a-z0-9]+", " ", str(name).lower()).strip()
+    return f" {s} "
+
+
+def _has_kw(norm: str, keyword: str) -> bool:
+    kw = re.sub(r"[^a-z0-9]+", " ", keyword.lower()).strip()
+    return f" {kw} " in norm
+
+
+# Ordered from most specific (multi-word) to least specific. First match
+# wins, so "total cost" is caught before the bare "cost" check would
+# otherwise misfire, and "unit price" is caught before bare "price".
+PRIORITY_KEYWORDS = [
+    ("total cost", "additive"), ("total price", "additive"), ("total revenue", "additive"),
+    ("total sales", "additive"), ("total profit", "additive"), ("gross sales", "additive"),
+    ("net revenue", "additive"), ("gross revenue", "additive"), ("discount amount", "additive"),
+    ("total expense", "additive"), ("total expenses", "additive"), ("total fare", "additive"),
+    ("unit price", "average"), ("unit cost", "average"), ("avg price", "average"),
+    ("average price", "average"), ("price per unit", "average"), ("avg rating", "average"),
+    ("customer rating", "average"),
+    ("load factor", "percentage"), ("profit margin", "percentage"), ("conversion rate", "percentage"),
+    ("occupancy rate", "percentage"), ("discount rate", "percentage"), ("discount percent", "percentage"),
+    ("growth rate", "percentage"), ("margin percent", "percentage"), ("occupancy percent", "percentage"),
+    ("percent", "percentage"), ("pct", "percentage"), ("margin", "percentage"), ("ratio", "percentage"),
+    ("rate", "percentage"), ("occupancy", "percentage"), ("conversion", "percentage"),
+    ("revenue", "additive"), ("sales", "additive"), ("profit", "additive"), ("cost", "additive"),
+    ("quantity", "additive"), ("units", "additive"), ("fuel", "additive"), ("passengers", "additive"),
+    ("flights", "additive"), ("expense", "additive"), ("expenses", "additive"), ("amount", "additive"),
+    ("price", "average"), ("age", "average"), ("salary", "average"), ("rating", "average"),
+    ("temperature", "average"), ("duration", "average"), ("score", "average"), ("satisfaction", "average"),
+]
+
+PRIORITY_CATEGORY_KEYWORDS = [
+    "product", "category", "type", "channel", "city", "region", "country",
+    "store", "department", "route", "payment method", "branch", "location",
+    "service", "segment", "airport",
+]
+
+
+def classify_metric(col_name: str, series: pd.Series) -> str:
+    """Classifies a numeric column as 'additive' (SUM), 'average' (MEAN),
+    'percentage' (MEAN, never summed), or 'identifier' (not calculated).
+    Falls back to 'additive' when genuinely uncertain — most unlabeled
+    business numbers are summable quantities, so that's the safer default.
+    """
+    if looks_like_identifier(series, col_name):
+        return "identifier"
+    if "%" in str(col_name):
+        return "percentage"
+    norm = _norm(col_name)
+    for kw, mtype in PRIORITY_KEYWORDS:
+        if _has_kw(norm, kw):
+            return mtype
+    return "additive"
+
+
+def choose_aggregation(metric_type: str):
+    if metric_type == "additive":
+        return "sum"
+    if metric_type in ("average", "percentage"):
+        return "mean"
+    return None
+
+
+def calculate_metric(df, col, metric_type):
+    agg = choose_aggregation(metric_type)
+    if agg == "sum":
+        return df[col].sum()
+    elif agg == "mean":
+        return df[col].mean()
+    return None
+
+
+def metric_label_prefix(metric_type: str) -> str:
+    """'Total' for additive metrics, 'Average' for average/percentage —
+    so a card never reads 'Total Unit Price' or 'Total Discount %'."""
+    return "Total" if metric_type == "additive" else "Average"
+
+
+def choose_breakdown_dimension(metric_col: str, category_cols: list, df: pd.DataFrame):
+    """Picks the most business-meaningful category to break a metric down
+    by — preferring Product/City/Channel-style columns over high-cardinality
+    or person-identifying columns, unless the metric is people-relevant
+    (e.g. a rating, where Employee/Customer becomes a sensible dimension).
+    """
+    if not category_cols:
+        return None
+    n = len(df)
+    metric_norm = _norm(metric_col)
+    is_people_relevant = any(_has_kw(metric_norm, kw) for kw in ["rating", "satisfaction", "score", "performance"])
+
+    best_col, best_score = None, float("-inf")
+    for col in category_cols:
+        norm = _norm(col)
+        score = 0.0
+        if any(_has_kw(norm, kw) for kw in PRIORITY_CATEGORY_KEYWORDS):
+            score += 3.0
+        nunique = df[col].nunique()
+        uniqueness_ratio = (nunique / n) if n else 1.0
+        score += (1 - uniqueness_ratio) * 2.0
+        is_person_like = any(_has_kw(norm, kw) for kw in ["name", "customer", "client"])
+        if is_person_like:
+            score += 0.5 if is_people_relevant else -1.5
+        if _has_kw(norm, "employee") and is_people_relevant:
+            score += 1.0
+        if score > best_score:
+            best_score, best_col = score, col
+    return best_col
+
+
+def _find_by_keywords(cols, keywords):
+    for kw in keywords:
+        for c in cols:
+            if _has_kw(_norm(c), kw):
+                return c
+    return None
+
+
+def detect_business_roles(classifications: dict):
+    """Finds which columns play which business role (gross sales, profit,
+    quantity, etc.) based on classification + name — used to build KPI
+    cards and key findings without guessing at columns that don't exist.
+    """
+    additive_cols = [c for c, t in classifications.items() if t == "additive"]
+    average_cols = [c for c, t in classifications.items() if t == "average"]
+    percentage_cols = [c for c, t in classifications.items() if t == "percentage"]
+
+    gross_sales_col = _find_by_keywords(additive_cols, ["gross sales", "gross revenue"])
+    net_revenue_col = _find_by_keywords(additive_cols, ["net revenue"])
+    if not net_revenue_col:
+        remaining = [c for c in additive_cols if c != gross_sales_col]
+        net_revenue_col = _find_by_keywords(remaining, ["revenue"])
+    profit_col = _find_by_keywords(additive_cols, ["profit"])
+    quantity_col = _find_by_keywords(additive_cols, ["quantity", "units", "unit count"])
+    discount_amount_col = _find_by_keywords(additive_cols, ["discount amount", "discount"])
+    cost_col = _find_by_keywords(additive_cols, ["total cost", "cost"])
+    unit_price_col = _find_by_keywords(average_cols, ["unit price", "price"])
+    rating_col = _find_by_keywords(average_cols, ["rating", "satisfaction", "score"])
+    margin_pct_col = _find_by_keywords(percentage_cols, ["margin"])
+    discount_pct_col = _find_by_keywords(percentage_cols, ["discount"])
+
+    return {
+        "gross_sales_col": gross_sales_col, "net_revenue_col": net_revenue_col,
+        "profit_col": profit_col, "quantity_col": quantity_col,
+        "discount_amount_col": discount_amount_col, "cost_col": cost_col,
+        "unit_price_col": unit_price_col, "rating_col": rating_col,
+        "margin_pct_col": margin_pct_col, "discount_pct_col": discount_pct_col,
+        "additive_cols": additive_cols, "average_cols": average_cols,
+        "percentage_cols": percentage_cols,
+    }
+
+
+def calculate_derived_kpis(df, roles):
+    """Only computes a derived KPI when every column it needs actually
+    exists in the file — never invents a metric from partial data.
+    """
+    derived = {}
+    gsc, qc = roles["gross_sales_col"], roles["quantity_col"]
+    if gsc and qc:
+        qty_total = df[qc].sum()
+        if qty_total:
+            derived["avg_selling_price"] = {"value": df[gsc].sum() / qty_total, "formula": f"{gsc} / {qc}"}
+
+    dac, gsc2 = roles["discount_amount_col"], roles["gross_sales_col"]
+    if dac and gsc2:
+        gross_total = df[gsc2].sum()
+        if gross_total:
+            derived["effective_discount_rate"] = {
+                "value": (df[dac].sum() / gross_total) * 100, "formula": f"{dac} / {gsc2} * 100"
+            }
+
+    pc = roles["profit_col"]
+    denom_col = roles["net_revenue_col"] or roles["gross_sales_col"]
+    if pc and denom_col:
+        denom_total = df[denom_col].sum()
+        if denom_total:
+            derived["overall_profit_margin"] = {
+                "value": (df[pc].sum() / denom_total) * 100, "formula": f"{pc} / {denom_col} * 100"
+            }
+
+    rc = roles["rating_col"]
+    if rc:
+        derived["avg_customer_rating"] = {"value": df[rc].mean(), "formula": None}
+
+    return derived
+
+
+def generate_business_kpis(df, classifications, roles, max_primary=4):
+    """Ordered list of primary KPI cards, prioritizing real business
+    meaning over column order: Gross Sales, Net Revenue, Profit, Quantity."""
+    priority_order = [roles["gross_sales_col"], roles["net_revenue_col"], roles["profit_col"], roles["quantity_col"]]
+    chosen = [c for c in priority_order if c]
+    remaining_additive = [c for c in roles["additive_cols"] if c not in chosen]
+    chosen += remaining_additive
+    chosen = chosen[:max_primary]
+    return [(c, df[c].sum(), "additive") for c in chosen]
+
+
+def generate_key_findings(df, roles, derived, fmt_func):
+    """Deterministic, template-based findings — every number traces
+    directly to a real calculation, nothing free-generated."""
+    order_noun = "orders" if any(_has_kw(_norm(c), "order") for c in df.columns) else "records"
+    n = len(df)
+    findings = []
+
+    gsc = roles["gross_sales_col"]
+    if gsc:
+        findings.append(f"Gross sales reached {fmt_func(df[gsc].sum())} across {n:,} {order_noun}.")
+
+    qc = roles["quantity_col"]
+    if qc and "avg_selling_price" in derived:
+        findings.append(
+            f"{fmt_func(df[qc].sum())} units were sold, corresponding to an average selling price of "
+            f"{fmt_func(derived['avg_selling_price']['value'])} per unit."
+        )
+    elif qc:
+        findings.append(f"{fmt_func(df[qc].sum())} units were sold across {n:,} {order_noun}.")
+
+    if "effective_discount_rate" in derived:
+        findings.append(f"Discounts reduced gross sales by approximately {fmt_func(derived['effective_discount_rate']['value'])}%.")
+
+    nrc, pc = roles["net_revenue_col"], roles["profit_col"]
+    if nrc and pc:
+        findings.append(f"Net revenue reached {fmt_func(df[nrc].sum())} and total profit was {fmt_func(df[pc].sum())}.")
+    elif pc:
+        findings.append(f"Total profit was {fmt_func(df[pc].sum())}.")
+
+    if "overall_profit_margin" in derived:
+        findings.append(f"Overall profit margin was {fmt_func(derived['overall_profit_margin']['value'])}%.")
+
+    if "avg_customer_rating" in derived:
+        findings.append(f"Average customer rating was {fmt_func(derived['avg_customer_rating']['value'])}.")
+
+    return findings
+
+
 def clean_column_names(df: pd.DataFrame) -> pd.DataFrame:
     """Strip BOM markers and stray whitespace some CSV/Excel exports add to headers."""
     df = df.copy()
@@ -204,30 +447,24 @@ def trend_pct(df, col):
     return ((second_half_mean - first_half_mean) / first_half_mean) * 100
 
 
-def top_bottom_by_category(df, num_col, cat_col):
-    """Which category leads and which trails for this metric, and by how much.
-
-    Uses min_count=1 so a category whose values are all missing shows up as
-    NaN (and gets dropped) rather than silently being summed to a
-    misleading 0 — which previously made real minimums look wrong.
-
-    Also returns each leader's row count, since a summed total (e.g. one
-    customer's total across all their orders) can legitimately exceed any
-    single row's value — without the count, that looks like a contradiction.
+def top_bottom_by_category(df, num_col, cat_col, agg="sum"):
+    """Which category leads and which trails for this metric, and by how
+    much — using the correct aggregation for the metric's type (sum for
+    additive metrics, mean for average/percentage ones). Uses min_count=1
+    on sums so an all-missing group shows as excluded, not a fake 0.
     """
-    stats = df.groupby(cat_col)[num_col].agg(total="sum", rows="count")
-    stats = stats[stats["rows"] > 0].sort_values("total", ascending=False)
+    grouped = df.groupby(cat_col)[num_col]
+    values = grouped.sum(min_count=1) if agg == "sum" else grouped.mean()
+    rows = grouped.count()
+    stats = pd.DataFrame({"value": values, "rows": rows}).dropna(subset=["value"])
+    stats = stats[stats["rows"] > 0].sort_values("value", ascending=False)
     if len(stats) == 0:
         return None
-    top = stats.iloc[0]
-    bottom = stats.iloc[-1]
+    top, bottom = stats.iloc[0], stats.iloc[-1]
     return {
-        "top_name": stats.index[0],
-        "top_value": top["total"],
-        "top_rows": int(top["rows"]),
-        "bottom_name": stats.index[-1],
-        "bottom_value": bottom["total"],
-        "bottom_rows": int(bottom["rows"]),
+        "top_name": stats.index[0], "top_value": top["value"], "top_rows": int(top["rows"]),
+        "bottom_name": stats.index[-1], "bottom_value": bottom["value"], "bottom_rows": int(bottom["rows"]),
+        "agg": agg,
     }
 
 
@@ -481,25 +718,69 @@ if uploaded:
     if all_id_cols:
         st.caption(f"Excluded as likely ID/reference columns (not real metrics or categories): {', '.join(all_id_cols)}")
 
+    # ---- Metric classification (additive / average / percentage) ----
+    # This drives every calculation below: sums only happen for metrics
+    # where summing makes business sense (Revenue, Quantity, Profit...);
+    # rates and per-unit metrics (Unit Price, Discount %, Margin %) are
+    # averaged instead, never summed.
+    classifications = {c: classify_metric(c, df[c]) for c in numeric_cols}
+    roles = detect_business_roles(classifications)
+    derived_kpis = calculate_derived_kpis(df, roles)
+
     # ---- Geo detection (countries, or explicit lat/lon columns) ----
     detected_country_col = detect_country_column(df, category_cols)
     detected_lat_col, detected_lon_col = detect_lat_lon_columns(df)
 
-    # ---- Instant overview: totals & averages for every real numeric column ----
-    # Shown immediately, before any focus is picked, so you see the full
-    # picture of what's in the file first.
+    # ---- Business KPIs (whole-file, always shown) ----
+    primary_kpis = generate_business_kpis(df, classifications, roles)
+    if primary_kpis:
+        st.subheader("Key business metrics")
+        cols = st.columns(len(primary_kpis))
+        for i, (label, value, mtype) in enumerate(primary_kpis):
+            with cols[i]:
+                st.metric(f"{metric_label_prefix(mtype)} {label}", fmt(value))
+
+        secondary_items = []
+        if "avg_selling_price" in derived_kpis:
+            secondary_items.append(("Average selling price", derived_kpis["avg_selling_price"]))
+        if "effective_discount_rate" in derived_kpis:
+            secondary_items.append(("Effective discount rate", derived_kpis["effective_discount_rate"]))
+        if "overall_profit_margin" in derived_kpis:
+            secondary_items.append(("Overall profit margin", derived_kpis["overall_profit_margin"]))
+        if "avg_customer_rating" in derived_kpis:
+            secondary_items.append(("Average customer rating", derived_kpis["avg_customer_rating"]))
+
+        if secondary_items:
+            cols2 = st.columns(len(secondary_items))
+            for i, (label, info) in enumerate(secondary_items):
+                unit = "%" if "rate" in label.lower() or "margin" in label.lower() else ""
+                tooltip = f"Calculated: {info['formula']}" if info.get("formula") else "Average across all records."
+                with cols2[i]:
+                    st.metric(label, f"{fmt(info['value'])}{unit}", help=tooltip)
+
+    # ---- Key findings (deterministic, template-based — no free text generation) ----
+    findings = generate_key_findings(df, roles, derived_kpis, fmt)
+    if findings:
+        st.subheader("Key findings")
+        for f in findings:
+            st.markdown(f"- {f}")
+
+    # ---- Overview table: correct aggregation per column type ----
     if numeric_cols:
-        st.subheader("Overview")
-        overview_rows = []
-        for c in numeric_cols:
-            overview_rows.append({
-                "Column": c,
-                "Total": fmt(df[c].sum()),
-                "Average": fmt(df[c].mean()),
-                "Min": fmt(df[c].min()),
-                "Max": fmt(df[c].max()),
-            })
-        st.dataframe(pd.DataFrame(overview_rows), hide_index=True, use_container_width=True)
+        with st.expander("Full column overview"):
+            overview_rows = []
+            for c in numeric_cols:
+                mtype = classifications[c]
+                value = calculate_metric(df, c, mtype)
+                overview_rows.append({
+                    "Column": c,
+                    "Type": mtype.capitalize(),
+                    f"{metric_label_prefix(mtype)}": fmt(value),
+                    "Min": fmt(df[c].min()),
+                    "Max": fmt(df[c].max()),
+                })
+            st.dataframe(pd.DataFrame(overview_rows), hide_index=True, use_container_width=True)
+            st.caption("Totals are shown only for additive metrics; rate/per-unit metrics show their average instead.")
 
     # ---- Focus selection ----
     # Build a simple menu of what the client could focus on, based purely on
@@ -522,7 +803,6 @@ if uploaded:
 
     # ---- Shared time-period control (used by Key Metrics, Deep Analysis, and the Trend chart) ----
     chosen_granularity = None
-    chosen_agg = "Sum"
     if len(date_cols) > 1:
         primary_date_col = st.selectbox(
             "Which date column should drive the trend analysis?", date_cols, key="primary_date_col"
@@ -541,42 +821,44 @@ if uploaded:
         chosen_granularity = auto_label if granularity_choice == "Auto (recommended)" else granularity_choice
         if granularity_choice == "Auto (recommended)":
             st.caption(f"Automatically grouped by **{chosen_granularity}**, based on the date range in your file.")
-        chosen_agg = st.radio(
-            "Aggregate as", ["Sum", "Average"], horizontal=True, key="date_agg_choice",
-            help="Sum makes sense for things like revenue or flights. Average makes more sense for rates or percentages.",
+        st.caption(
+            "Each metric is automatically summed or averaged based on what kind of "
+            "metric it is (e.g. Revenue is summed, Unit Price is averaged) — not manually chosen."
         )
 
-    # ---- Key metrics ----
+    # ---- Key metrics (focus-specific) ----
     if focus_numeric_cols:
         st.subheader("Key metrics")
         cols = st.columns(min(3, len(focus_numeric_cols)))
         for i, col in enumerate(focus_numeric_cols[:3]):
-            total = df[col].sum()
+            mtype = classifications[col]
+            agg_str = "Sum" if choose_aggregation(mtype) == "sum" else "Average"
+            value = calculate_metric(df, col, mtype)
 
             # Prefer a real calendar-period comparison; fall back to the
             # cruder first-half/second-half trend if there's no usable date.
             pv = None
             if primary_date_col and chosen_granularity:
-                pv = period_over_period_value(df, primary_date_col, col, chosen_granularity, chosen_agg)
+                pv = period_over_period_value(df, primary_date_col, col, chosen_granularity, agg_str)
 
             if pv:
                 pct_change = pv["change"]
                 tooltip = (
-                    f"{pv['granularity']} comparison ({pv['agg'].lower()}): "
-                    f"{pv['latest_label']} = {fmt(pv['latest_val'])}, "
+                    f"{pv['granularity']} comparison ({pv['agg'].lower()}, based on this being "
+                    f"a {mtype} metric): {pv['latest_label']} = {fmt(pv['latest_val'])}, "
                     f"{pv['previous_label']} = {fmt(pv['previous_val'])}."
                 )
                 if pv["partial"]:
                     tooltip += " Most recent, still-in-progress period was excluded from this comparison."
             else:
-                pct_change = trend_pct(df, col)
+                pct_change = trend_pct(df, col) if agg_str == "Sum" else 0.0
                 tooltip = (
-                    "No usable date column to compare real time periods, so this compares the "
-                    "average of the first half of the file's rows to the average of the second half."
+                    f"No usable date column to compare real time periods. This is a {mtype} metric, "
+                    f"so its {agg_str.lower()} is shown."
                 )
 
             with cols[i]:
-                st.metric(col, fmt(total), f"{pct_change:+.1f}%", help=tooltip)
+                st.metric(f"{metric_label_prefix(mtype)} {col}", fmt(value), f"{pct_change:+.1f}%", help=tooltip)
     else:
         st.info("No numeric metric columns detected for this focus.")
 
@@ -584,13 +866,14 @@ if uploaded:
     st.subheader("Deep analysis")
     metric_trends = {}  # col -> pct_change, used later for the relationship section
     for col in focus_numeric_cols:
-        total = df[col].sum()
-        mean = df[col].mean()
-        anomaly_count = count_anomalies(df, col)
+        mtype = classifications[col]
+        agg_str = "Sum" if choose_aggregation(mtype) == "sum" else "Average"
+        value = calculate_metric(df, col, mtype)
+        anomaly_count = count_anomalies(df, col) if mtype == "additive" else 0
 
-        with st.expander(f"**{col}**", expanded=True):
+        with st.expander(f"**{col}** ({mtype})", expanded=True):
             bullets = [
-                f"Total: {fmt(total)}, average {fmt(mean)} per record "
+                f"{metric_label_prefix(mtype)}: {fmt(value)} "
                 f"(range {fmt(df[col].min())}\u2013{fmt(df[col].max())}).",
             ]
 
@@ -598,37 +881,50 @@ if uploaded:
             # fall back to the cruder first-half/second-half trend otherwise.
             pop_text = None
             if primary_date_col and chosen_granularity:
-                pop_text = period_over_period(df, primary_date_col, col, chosen_granularity, chosen_agg)
+                pop_text = period_over_period(df, primary_date_col, col, chosen_granularity, agg_str)
 
             if pop_text:
                 bullets.append(pop_text)
-                # Still track a rough trend number for the relationships section
-                pct_change = trend_pct(df, col)
+                pct_change = trend_pct(df, col) if agg_str == "Sum" else 0.0
                 metric_trends[col] = pct_change
             else:
-                pct_change = trend_pct(df, col)
+                pct_change = trend_pct(df, col) if agg_str == "Sum" else 0.0
                 metric_trends[col] = pct_change
-                if abs(pct_change) > 1:
+                if agg_str == "Sum" and abs(pct_change) > 1:
                     direction = "trending up" if pct_change > 0 else "trending down"
                     bullets.append(
                         f"{direction.capitalize()}, roughly {fmt(abs(pct_change))}% "
                         f"{'increase' if pct_change > 0 else 'decrease'} comparing the first half of the "
                         f"file's rows to the second half (no usable date column to compare real periods)."
                     )
-                else:
+                elif agg_str == "Sum":
                     bullets.append("Fairly flat across the file (no meaningful trend detected).")
+                else:
+                    bullets.append("No usable date column to compare real time periods for this metric.")
 
-            # Top / bottom contributor by the first relevant category column
+            # Top / bottom contributor — auto-picks a business-meaningful
+            # category (Product, City, Channel...) rather than always using
+            # the first category column, and never sums an average/percentage
+            # metric when finding the leader.
             if focus_category_cols:
-                tb = top_bottom_by_category(df, col, focus_category_cols[0])
+                best_cat_col = choose_breakdown_dimension(col, focus_category_cols, df)
+                tb_agg = "sum" if agg_str == "Sum" else "mean"
+                tb = top_bottom_by_category(df, col, best_cat_col, agg=tb_agg) if best_cat_col else None
                 if tb and tb["top_name"] != tb["bottom_name"]:
-                    top_rows_note = f" across {tb['top_rows']} record{'s' if tb['top_rows'] != 1 else ''}" if tb["top_rows"] > 1 else ""
-                    bottom_rows_note = f" across {tb['bottom_rows']} record{'s' if tb['bottom_rows'] != 1 else ''}" if tb["bottom_rows"] > 1 else ""
-                    bullets.append(
-                        f"By **{focus_category_cols[0]}**: \"{tb['top_name']}\" leads with {fmt(tb['top_value'])} total"
-                        f"{top_rows_note}, while \"{tb['bottom_name']}\" trails at {fmt(tb['bottom_value'])}"
-                        f"{bottom_rows_note}."
-                    )
+                    if tb_agg == "sum":
+                        top_rows_note = f" across {tb['top_rows']} record{'s' if tb['top_rows'] != 1 else ''}" if tb["top_rows"] > 1 else ""
+                        bottom_rows_note = f" across {tb['bottom_rows']} record{'s' if tb['bottom_rows'] != 1 else ''}" if tb["bottom_rows"] > 1 else ""
+                        bullets.append(
+                            f"By **{best_cat_col}**: \"{tb['top_name']}\" leads with {fmt(tb['top_value'])} total"
+                            f"{top_rows_note}, while \"{tb['bottom_name']}\" trails at {fmt(tb['bottom_value'])}"
+                            f"{bottom_rows_note}."
+                        )
+                    else:
+                        bullets.append(
+                            f"By **{best_cat_col}**: \"{tb['top_name']}\" had the highest average {col} "
+                            f"({fmt(tb['top_value'])}), while \"{tb['bottom_name']}\" had the lowest "
+                            f"({fmt(tb['bottom_value'])})."
+                        )
 
             if anomaly_count > 0:
                 bullets.append(
@@ -674,6 +970,9 @@ if uploaded:
 
         date_col = date_cols[0]
         num_col = focus_numeric_cols[0]
+        num_col_mtype = classifications[num_col]
+        chart_agg = choose_aggregation(num_col_mtype)  # "sum" or "mean", based on this metric's type
+        st.caption(f"Showing **{metric_label_prefix(num_col_mtype).lower()}** of {num_col} per period (a {num_col_mtype} metric).")
         chart_df = df[[date_col, num_col]].copy()
         chart_df[date_col] = pd.to_datetime(chart_df[date_col], errors="coerce")
         chart_df = chart_df.dropna(subset=[date_col]).sort_values(date_col)
@@ -681,7 +980,7 @@ if uploaded:
         if len(chart_df) > 1:
             freq = GRANULARITY_FREQ[chosen_granularity]
             grouped = chart_df.set_index(date_col).resample(freq)[num_col]
-            grouped = grouped.sum() if chosen_agg == "Sum" else grouped.mean()
+            grouped = grouped.sum() if chart_agg == "sum" else grouped.mean()
             grouped = grouped.reset_index()
 
             if len(grouped) < 2:
@@ -702,12 +1001,6 @@ if uploaded:
     if focus_category_cols:
         st.subheader("Breakdown")
         col_a, col_b = st.columns([2, 3])
-        with col_a:
-            if len(focus_category_cols) > 1:
-                cat_col = st.selectbox("Break down by", focus_category_cols, key="breakdown_cat_col")
-            else:
-                cat_col = focus_category_cols[0]
-                st.caption(f"Breaking down by **{cat_col}**")
         with col_b:
             if len(focus_numeric_cols) > 1:
                 metric_for_breakdown = st.selectbox(
@@ -718,13 +1011,32 @@ if uploaded:
             else:
                 metric_for_breakdown = None
 
+        recommended_cat_col = (
+            choose_breakdown_dimension(metric_for_breakdown, focus_category_cols, df)
+            if metric_for_breakdown else focus_category_cols[0]
+        )
+        with col_a:
+            if len(focus_category_cols) > 1:
+                default_idx = focus_category_cols.index(recommended_cat_col) if recommended_cat_col in focus_category_cols else 0
+                cat_col = st.selectbox(
+                    "Break down by", focus_category_cols, index=default_idx, key="breakdown_cat_col",
+                    help=f"Recommended: {recommended_cat_col} (based on category relevance and cardinality).",
+                )
+            else:
+                cat_col = focus_category_cols[0]
+                st.caption(f"Breaking down by **{cat_col}**")
+
         breakdown_chart_type = st.radio(
             "Chart type", ["Bar", "Horizontal bar", "Pie", "Donut", "Line"],
             horizontal=True, key="breakdown_chart_type"
         )
         if metric_for_breakdown:
-            breakdown = df.groupby(cat_col)[metric_for_breakdown].sum().sort_values(ascending=False).head(10)
-            y_label = metric_for_breakdown
+            metric_mtype = classifications[metric_for_breakdown]
+            breakdown_agg = choose_aggregation(metric_mtype)
+            grouped = df.groupby(cat_col)[metric_for_breakdown]
+            breakdown = (grouped.sum(min_count=1) if breakdown_agg == "sum" else grouped.mean()).dropna()
+            breakdown = breakdown.sort_values(ascending=False).head(10)
+            y_label = f"{metric_label_prefix(metric_mtype)} {metric_for_breakdown}"
         else:
             breakdown = df[cat_col].value_counts().head(10)
             y_label = "Count"
